@@ -93,7 +93,7 @@ jobs:
             --enable-tcg \
             --enable-pixman \
             --enable-vnc \
-            --enable-slirp=system \
+            --enable-slirp \
             --disable-werror
 
           ninja qemu-system-x86_64
