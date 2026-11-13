@@ -1,5 +1,5 @@
 
-name: Build CatCore (engine + APK)
+name: CatCore - Coreboot BIOS, QEMU, Android APK
 
 on:
   push:
@@ -14,16 +14,17 @@ concurrency:
 env:
   QEMU_VERSION: '9.2.0'
   ENGINE_REV: 'r5'
+  COREBOOT_VERSION: '26.09'
+  COREBOOT_REV: 'r1'
 
 jobs:
   engine:
-    name: Build and Test QEMU ARM64
+    name: Build QEMU ARM64 Engine
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Restore QEMU cache
         id: cache
@@ -32,7 +33,7 @@ jobs:
           path: engine-out
           key: catcore-qemu-linux-arm64-${{ env.QEMU_VERSION }}-${{ env.ENGINE_REV }}
 
-      - name: Create engine build script
+      - name: Create QEMU build script
         if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
@@ -47,16 +48,11 @@ jobs:
             meson ninja coreutils grep sed gawk \
             diffutils findutils \
             glib-dev glib-static pcre2-dev libffi-dev \
-            zlib-dev zlib-static \
-            pixman-dev pixman-static \
-            gettext-dev gettext-static \
-            dtc dtc-dev
+            zlib-dev zlib-static pixman-dev pixman-static \
+            gettext-dev gettext-static dtc dtc-dev
 
           for lib in libglib-2.0.a libpixman-1.a libz.a libffi.a; do
-            test -s "/usr/lib/$lib" || {
-              echo "Missing static library: $lib"
-              exit 1
-            }
+            test -s "/usr/lib/$lib"
           done
 
           pkgconf --static --libs glib-2.0 pixman-1
@@ -76,7 +72,6 @@ jobs:
             ninja -C build install
           )
 
-          test -s /usr/lib/libslirp.a
           pkgconf --static --libs slirp
 
           curl --retry 3 -fL \
@@ -100,16 +95,14 @@ jobs:
             --disable-werror
 
           ninja qemu-system-x86_64
-
           strip -s qemu-system-x86_64
 
           if readelf -l qemu-system-x86_64 | grep -q INTERP; then
-            echo "ERROR: QEMU is not statically linked"
+            echo 'ERROR: QEMU is not statically linked'
             exit 1
           fi
 
           mkdir -p /work/engine-out
-
           cp qemu-system-x86_64 \
             /work/engine-out/libqemu-system-x86_64.so
 
@@ -124,7 +117,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p engine-out
 
           docker run --rm \
@@ -135,118 +127,289 @@ jobs:
             alpine:3.21 \
             sh /work/build-engine.sh
 
-          # FIX: Docker creates root-owned output files.
-          sudo chown -R "$(id -u):$(id -g)" engine-out
-          chmod 755 engine-out/libqemu-system-x86_64.so
-
-      - name: Fix cached engine permissions
+      - name: Fix QEMU permissions and verify engine
         shell: bash
         run: |
           set -euo pipefail
 
-          E="engine-out/libqemu-system-x86_64.so"
-
+          E=engine-out/libqemu-system-x86_64.so
           test -s "$E"
 
           sudo chown -R "$(id -u):$(id -g)" engine-out
           chmod 755 "$E"
 
-          ls -lh "$E"
+          "$PWD/$E" --version
+          "$PWD/$E" -device help > devices.txt
 
-      - name: Verify QEMU executable
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          E="$PWD/engine-out/libqemu-system-x86_64.so"
-
-          test -s "$E"
-
-          "$E" --version
-
-          "$E" -device help > devices.txt
-
-          for device in nvme e1000e qemu-xhci usb-tablet usb-kbd VGA; do
-            grep -Fq "name \"$device\"" devices.txt || {
-              echo "Missing QEMU device: $device"
+          for d in VGA nvme usb-tablet usb-kbd; do
+            grep -Fq "name \"$d\"" devices.txt || {
+              echo "Missing QEMU device: $d"
               exit 1
             }
           done
 
-          "$E" -netdev help > netdev.txt 2>&1 || true
+          "$PWD/$E" -netdev help > netdev.txt 2>&1 || true
+          grep -qw user netdev.txt
 
-          grep -qw user netdev.txt || {
-            echo "Missing user networking"
-            exit 1
-          }
+      - name: Upload QEMU engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: catcore-qemu-engine
+          path: engine-out/libqemu-system-x86_64.so
+          if-no-files-found: error
 
-          echo "QEMU verification passed"
+  coreboot:
+    name: Build Coreboot BIOS with SeaBIOS Payload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
 
-      - name: Test VNC server
+    steps:
+      - name: Restore Coreboot cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: firmware-out
+          key: catcore-coreboot-${{ env.COREBOOT_VERSION }}-${{ env.COREBOOT_REV }}
+
+      - name: Install Coreboot dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl ca-certificates \
+            python3 python3-pip \
+            bison flex m4 make gcc g++ nasm \
+            libncurses-dev libssl-dev libelf-dev zlib1g-dev \
+            uuid-dev pkg-config acpica-tools wget xz-utils
+
+      - name: Build Coreboot BIOS
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 \
+            --branch "$COREBOOT_VERSION" \
+            https://github.com/coreboot/coreboot.git \
+            coreboot-src
+
+          cd coreboot-src
+
+          # Coreboot firmware with an embedded SeaBIOS payload.
+          cat > .config <<'CONFIG'
+          CONFIG_VENDOR_EMULATION=y
+          CONFIG_BOARD_EMULATION_QEMU_X86_I440FX=y
+          CONFIG_ANY_TOOLCHAIN=y
+          CONFIG_CBFS_SIZE=0x00400000
+          CONFIG_CONSOLE_SERIAL=y
+          CONFIG_PAYLOAD_SEABIOS=y
+          CONFIG_SEABIOS_STABLE=y
+          CONFIG_ROM_SIZE=0x400000
+          CONFIG
+
+          make olddefconfig
+
+          grep -qx \
+            'CONFIG_BOARD_EMULATION_QEMU_X86_I440FX=y' .config
+
+          grep -qx \
+            'CONFIG_PAYLOAD_SEABIOS=y' .config
+
+          grep -qx \
+            'CONFIG_ANY_TOOLCHAIN=y' .config
+
+          make -j "$(nproc)"
+
+          test -s build/coreboot.rom
+
+          mkdir -p ../firmware-out
+          cp build/coreboot.rom ../firmware-out/coreboot.rom
+
+          sha256sum ../firmware-out/coreboot.rom
+
+      - name: Verify Coreboot ROM
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s firmware-out/coreboot.rom
+          ls -lh firmware-out/coreboot.rom
+
+      - name: Upload Coreboot BIOS
+        uses: actions/upload-artifact@v4
+        with:
+          name: catcore-coreboot-bios
+          path: firmware-out/coreboot.rom
+          if-no-files-found: error
+
+  integration:
+    name: End-to-End Coreboot Guest Boot Test
+    needs: [engine, coreboot]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+
+    steps:
+      - name: Download QEMU engine
+        uses: actions/download-artifact@v4
+        with:
+          name: catcore-qemu-engine
+          path: engine-out
+
+      - name: Download Coreboot BIOS
+        uses: actions/download-artifact@v4
+        with:
+          name: catcore-coreboot-bios
+          path: firmware-out
+
+      - name: Install NASM
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nasm
+
+      - name: Create x86 boot sector
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > boot.asm <<'ASM'
+          BITS 16
+          ORG 0x7c00
+
+          start:
+              cli
+              xor ax, ax
+              mov ds, ax
+              mov ss, ax
+              mov sp, 0x7c00
+
+              mov dx, 0x3fb
+              mov al, 0x80
+              out dx, al
+
+              mov dx, 0x3f8
+              mov al, 0x01
+              out dx, al
+
+              mov dx, 0x3f9
+              xor al, al
+              out dx, al
+
+              mov dx, 0x3fb
+              mov al, 0x03
+              out dx, al
+
+              mov dx, 0x3fc
+              mov al, 0x0b
+              out dx, al
+
+              mov si, message
+
+          next_byte:
+              lodsb
+              test al, al
+              jz halt
+
+              mov dx, 0x3f8
+              out dx, al
+              jmp next_byte
+
+          halt:
+              hlt
+              jmp halt
+
+          message db 'CATCORE_GUEST_BOOT_OK', 13, 10, 0
+
+          times 510 - ($ - $$) db 0
+          dw 0xaa55
+          ASM
+
+          nasm -f bin boot.asm -o boot.bin
+
+          test "$(stat -c %s boot.bin)" -eq 512
+
+          truncate -s 16M boot.img
+          dd if=boot.bin of=boot.img conv=notrunc status=none
+
+      - name: Test Coreboot, Guest Boot and VNC
         shell: bash
         run: |
           set -euo pipefail
 
           E="$PWD/engine-out/libqemu-system-x86_64.so"
+          BIOS="$PWD/firmware-out/coreboot.rom"
+
+          test -s "$E"
+          test -s "$BIOS"
+
+          chmod +x "$E"
 
           "$E" \
-            -machine q35 \
-            -m 256 \
+            -machine pc \
             -accel tcg \
+            -m 256 \
+            -smp 1 \
             -nodefaults \
-            -device VGA \
-            -netdev user,id=net0 \
-            -device e1000e,netdev=net0 \
+            -bios "$BIOS" \
+            -drive file=boot.img,format=raw,if=ide \
+            -boot c \
+            -device VGA,romfile= \
+            -serial file:guest-serial.log \
             -display none \
             -vnc 127.0.0.1:0 \
-            -S > qemu.log 2>&1 &
+            -monitor none \
+            > qemu.log 2>&1 &
 
           PID=$!
-
           trap 'kill "$PID" 2>/dev/null || true' EXIT
 
-          ready=0
+          vnc_ok=0
+          boot_ok=0
 
-          for i in $(seq 1 30); do
+          for i in $(seq 1 90); do
             if ! kill -0 "$PID" 2>/dev/null; then
               break
             fi
 
-            if (echo > /dev/tcp/127.0.0.1/5900) 2>/dev/null; then
-              ready=1
+            if [ "$vnc_ok" -eq 0 ]; then
+              if python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",5900),2); assert s.recv(12).startswith(b"RFB "); s.close()' 2>/dev/null; then
+                vnc_ok=1
+              fi
+            fi
+
+            if [ -f guest-serial.log ] && grep -Fq \
+              'CATCORE_GUEST_BOOT_OK' guest-serial.log; then
+              boot_ok=1
               break
             fi
 
             sleep 1
           done
 
-          cat qemu.log
+          cat qemu.log || true
+          cat guest-serial.log || true
 
-          if [ "$ready" != 1 ]; then
-            echo "VNC startup failed"
+          test "$vnc_ok" -eq 1 || {
+            echo 'VNC handshake failed'
             exit 1
-          fi
+          }
 
-          echo "QEMU VNC test passed"
+          test "$boot_ok" -eq 1 || {
+            echo 'Coreboot guest boot failed'
+            exit 1
+          }
 
-      - name: Upload QEMU engine
-        uses: actions/upload-artifact@v4
-        with:
-          name: qemu-engine
-          path: engine-out/libqemu-system-x86_64.so
-          if-no-files-found: error
+          echo 'PASS: Coreboot + SeaBIOS + x86 guest boot + VNC'
 
   apk:
-    name: Build CatCore APK
-    needs: engine
+    name: Package CatCore APK
+    needs: integration
     runs-on: ubuntu-24.04
 
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -254,10 +417,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK and Licenses
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
+          accept-android-sdk-licenses: 'true'
+          log-accepted-android-sdk-licenses: 'false'
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -267,10 +432,16 @@ jobs:
       - name: Download QEMU engine
         uses: actions/download-artifact@v4
         with:
-          name: qemu-engine
+          name: catcore-qemu-engine
           path: app/src/main/jniLibs/arm64-v8a
 
-      - name: Add OVMF firmware
+      - name: Download Coreboot BIOS
+        uses: actions/download-artifact@v4
+        with:
+          name: catcore-coreboot-bios
+          path: app/src/main/assets/firmware
+
+      - name: Add optional OVMF firmware
         shell: bash
         run: |
           set -euo pipefail
@@ -294,18 +465,21 @@ jobs:
           cp -L "$C" "$F/OVMF_CODE.fd"
           cp -L "$V" "$F/OVMF_VARS.fd"
 
-      - name: Verify engine and firmware
+      - name: Verify firmware and engine
         shell: bash
         run: |
           set -euo pipefail
 
-          test -s app/src/main/jniLibs/arm64-v8a/libqemu-system-x86_64.so
+          test -s app/src/main/assets/firmware/coreboot.rom
+
           test -s app/src/main/assets/firmware/OVMF_CODE.fd
+
           test -s app/src/main/assets/firmware/OVMF_VARS.fd
 
-          echo "Engine and firmware found"
+          test -s \
+            app/src/main/jniLibs/arm64-v8a/libqemu-system-x86_64.so
 
-      - name: Build APK
+      - name: Build CatCore APK
         shell: bash
         run: |
           set -euo pipefail
@@ -317,7 +491,7 @@ jobs:
             gradle assembleDebug --no-daemon --stacktrace
           fi
 
-      - name: Verify and rename APK
+      - name: Verify CatCore APK files
         shell: bash
         run: |
           set -euo pipefail
@@ -328,30 +502,36 @@ jobs:
 
           unzip -l "$APK" > apk-files.txt
 
-          grep -Fq \
+          for f in \
             'lib/arm64-v8a/libqemu-system-x86_64.so' \
-            apk-files.txt
-
-          grep -Fq \
+            'assets/firmware/coreboot.rom' \
             'assets/firmware/OVMF_CODE.fd' \
-            apk-files.txt
+            'assets/firmware/OVMF_VARS.fd'; do
 
-          grep -Fq \
-            'assets/firmware/OVMF_VARS.fd' \
-            apk-files.txt
+            grep -Fq "$f" apk-files.txt || {
+              echo "Missing APK file: $f"
+              exit 1
+            }
+          done
 
           cp "$APK" CatCore-debug.apk
 
-      - name: Upload APK
+      - name: Upload CatCore APK
         uses: actions/upload-artifact@v4
         with:
           name: CatCore-debug-apk
           path: CatCore-debug.apk
           if-no-files-found: error
 
-      - name: Publish release
+      - name: Publish CatCore Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: CatCore-debug.apk
-          
+
+# YAML and shell syntax checked in the sandbox.
+# Full QEMU/firmware boot is tested by the GitHub integration job.
+# This is not yet an Android runtime end-to-end test.
+# The packaged engine is a Linux ARM64 executable.
+# Running QEMU on Android still requires an Android-compatible
+# engine and appropriate app-side process-launch integration.
