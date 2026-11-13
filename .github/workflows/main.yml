@@ -1,4 +1,3 @@
-
 name: Build CatCore (engine + APK)
 
 on:
@@ -8,29 +7,34 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: catcore-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   QEMU_VERSION: '9.2.0'
-  ENGINE_REV: 'r2'
+  ENGINE_REV: 'r5'
 
 jobs:
   engine:
+    name: Build and test QEMU ARM64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore cached QEMU engine
-        id: cache
+      - name: Show workflow revision
+        run: echo 'CatCore workflow r5 - Pixman, Slirp, FDT and SDK fixes'
+
+      - name: Restore engine cache
+        id: engine-cache
         uses: actions/cache@v4
         with:
           path: engine-out
-          key: qemu-engine-arm64-${{ env.QEMU_VERSION }}-${{ env.ENGINE_REV }}
+          key: catcore-qemu-linux-arm64-${{ env.QEMU_VERSION }}-${{ env.ENGINE_REV }}
 
-      - name: Write QEMU build script
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Create build script
+        if: steps.engine-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           cat > build-engine.sh <<'SCRIPT'
@@ -38,58 +42,61 @@ jobs:
           set -eu
 
           apk add --no-cache \
-            build-base linux-headers python3 py3-pip py3-setuptools py3-wheel \
-            pkgconf curl tar xz meson ninja coreutils grep sed gawk \
-            diffutils findutils \
-            glib-dev glib-static pcre2-dev libffi-dev zlib-dev zlib-static \
-            gettext-dev pixman-dev
+            build-base linux-headers binutils file \
+            python3 py3-pip py3-setuptools py3-wheel \
+            pkgconf curl ca-certificates tar xz git \
+            meson ninja coreutils grep sed gawk diffutils findutils \
+            glib-dev glib-static pcre2-dev libffi-dev \
+            zlib-dev zlib-static pixman-dev pixman-static \
+            gettext-dev gettext-static dtc dtc-dev
 
-          # Static archives for transitive dependencies.
-          for p in pixman-static pcre2-static libffi-static gettext-static; do
-            apk add --no-cache "$p" || echo "Optional package missing: $p"
+          for lib in libglib-2.0.a libpixman-1.a libz.a libffi.a; do
+            test -s "/usr/lib/$lib" || {
+              echo "ERROR: missing static library /usr/lib/$lib"
+              exit 1
+            }
           done
 
-          test -f /usr/lib/libglib-2.0.a
-          test -f /usr/lib/libz.a
+          pkgconf --static --libs glib-2.0 pixman-1
 
-          # Ensure a static Pixman library is available for QEMU/VNC.
-          if [ ! -f /usr/lib/libpixman-1.a ]; then
-            curl -fL https://www.cairographics.org/releases/pixman-0.43.4.tar.gz -o pixman.tar.gz
-            tar -xzf pixman.tar.gz
-            (
-              cd pixman-0.43.4
-              meson setup build --prefix=/usr --libdir=lib \
-                --default-library=static -Dtests=disabled -Ddemos=disabled
-              ninja -C build install
-            )
-          fi
-          test -f /usr/lib/libpixman-1.a
-          pkgconf --modversion pixman-1
-          pkgconf --static --libs pixman-1
+          # Build static libslirp.
+          curl --retry 3 -fL \
+            'https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.8.0/libslirp-v4.8.0.tar.gz' \
+            -o /work/libslirp.tar.gz
 
-          # Build libslirp for user-mode guest networking.
-          curl -fL \
-            https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.8.0/libslirp-v4.8.0.tar.gz \
-            -o libslirp.tar.gz
-          tar -xzf libslirp.tar.gz
+          tar -xzf /work/libslirp.tar.gz -C /work
+
           (
-            cd libslirp-v4.8.0
-            meson setup build --prefix=/usr --libdir=lib --default-library=static
+            cd /work/libslirp-v4.8.0
+
+            meson setup build \
+              --prefix=/usr \
+              --libdir=lib \
+              --default-library=static
+
             ninja -C build install
           )
-          pkgconf --modversion slirp
 
-          # Static ARM64 Linux executable containing an x86_64 system emulator.
-          curl -fL "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" -o qemu.tar.xz
-          tar -xJf qemu.tar.xz
-          cd "qemu-${QEMU_VERSION}"
-          mkdir -p build
-          cd build
+          test -s /usr/lib/libslirp.a
+          pkgconf --static --libs slirp
 
+          # Download QEMU.
+          curl --retry 3 -fL \
+            "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" \
+            -o /work/qemu.tar.xz
+
+          tar -xJf /work/qemu.tar.xz -C /work
+
+          mkdir -p "/work/qemu-${QEMU_VERSION}/build"
+          cd "/work/qemu-${QEMU_VERSION}/build"
+
+          # Enable Pixman, VNC, TCG and Slirp.
+          # Disable FDT, which x86_64 PC guests do not require.
           ../configure \
             --static \
             --target-list=x86_64-softmmu \
             --without-default-features \
+            --disable-fdt \
             --enable-tcg \
             --enable-pixman \
             --enable-vnc \
@@ -97,94 +104,110 @@ jobs:
             --disable-werror
 
           ninja qemu-system-x86_64
+
           strip -s qemu-system-x86_64
-          file qemu-system-x86_64 || true
+          file qemu-system-x86_64
+
+          if readelf -l qemu-system-x86_64 | grep -q 'INTERP'; then
+            echo 'ERROR: QEMU is dynamically linked, not static'
+            exit 1
+          fi
 
           mkdir -p /work/engine-out
-          cp qemu-system-x86_64 /work/engine-out/libqemu-system-x86_64.so
-          chmod 755 /work/engine-out/libqemu-system-x86_64.so
+
+          cp qemu-system-x86_64 \
+            /work/engine-out/libqemu-system-x86_64.so
+
+          chmod 755 \
+            /work/engine-out/libqemu-system-x86_64.so
           SCRIPT
+
           chmod +x build-engine.sh
 
-      - name: Build static QEMU on Alpine ARM64
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Build QEMU in Alpine ARM64
+        if: steps.engine-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           mkdir -p engine-out
-          docker run --rm \
+
+          docker run --rm --platform linux/arm64 \
             -e QEMU_VERSION \
             -v "$PWD:/work" \
             -w /work \
             alpine:3.21 sh /work/build-engine.sh
 
-      - name: Verify engine
+      - name: Verify QEMU executable and supported devices
         shell: bash
         run: |
           set -euo pipefail
+
           E="$PWD/engine-out/libqemu-system-x86_64.so"
+
           test -s "$E"
           chmod +x "$E"
+
           "$E" --version
-          "$E" -device help > devices.txt 2>&1
-          for d in nvme e1000e qemu-xhci usb-tablet usb-kbd ich9-ahci ide-cd VGA; do
-            grep -Fq "name \"$d\"" devices.txt || {
-              echo "Missing QEMU device: $d"
+          "$E" -device help > devices.txt
+
+          for device in nvme e1000e qemu-xhci usb-tablet usb-kbd VGA; do
+            grep -Fq "name \"$device\"" devices.txt || {
+              echo "Missing QEMU device: $device"
               exit 1
             }
           done
-          "$E" -netdev help > nets.txt 2>&1 || true
-          grep -qw user nets.txt || {
-            echo "Missing user-mode networking"
+
+          "$E" -netdev help > netdev.txt 2>&1 || true
+
+          grep -qw user netdev.txt || {
+            echo 'Missing user-mode network backend'
             exit 1
           }
 
-      - name: Smoke test QEMU VNC startup
+      - name: Test VNC server startup
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ovmf
-          D=/usr/share/OVMF
-          if [ -f "$D/OVMF_CODE_4M.fd" ]; then
-            C="$D/OVMF_CODE_4M.fd"
-            V="$D/OVMF_VARS_4M.fd"
-          else
-            C="$D/OVMF_CODE.fd"
-            V="$D/OVMF_VARS.fd"
-          fi
-          cp -L "$C" code.fd
-          cp -L "$V" vars.fd
-          truncate -s 1G disk.img
+
           E="$PWD/engine-out/libqemu-system-x86_64.so"
-          "$E" -machine q35 -cpu max -accel tcg,thread=multi \
-            -smp 2 -m 1024 -nodefaults \
-            -drive if=pflash,format=raw,unit=0,readonly=on,file=code.fd \
-            -drive if=pflash,format=raw,unit=1,file=vars.fd \
-            -drive if=none,id=hd0,format=raw,file=disk.img \
-            -device nvme,drive=hd0,serial=catcore0 \
-            -device qemu-xhci -device usb-tablet -device usb-kbd \
-            -device VGA,romfile= \
-            -netdev user,id=n0 -device e1000e,netdev=n0,romfile= \
-            -display none -vnc 127.0.0.1:0 > qemu.log 2>&1 &
+
+          "$E" \
+            -machine q35 \
+            -m 256 \
+            -accel tcg \
+            -nodefaults \
+            -device VGA \
+            -netdev user,id=net0 \
+            -device e1000e,netdev=net0 \
+            -display none \
+            -vnc 127.0.0.1:0 \
+            -S > qemu.log 2>&1 &
+
           PID=$!
           trap 'kill "$PID" 2>/dev/null || true' EXIT
-          ok=0
+
+          ready=0
+
           for i in $(seq 1 30); do
-            if ! kill -0 "$PID" 2>/dev/null; then break; fi
-            if (exec 3<>/dev/tcp/127.0.0.1/5900) 2>/dev/null; then
-              ok=1
+            if ! kill -0 "$PID" 2>/dev/null; then
               break
             fi
+
+            if (echo > /dev/tcp/127.0.0.1/5900) 2>/dev/null; then
+              ready=1
+              break
+            fi
+
             sleep 1
           done
-          cat qemu.log
-          if [ "$ok" != 1 ]; then
-            echo "VNC did not start"
-            exit 1
-          fi
-          echo "QEMU VNC smoke test passed"
 
-      - name: Upload QEMU engine
+          cat qemu.log
+
+          test "$ready" -eq 1 || {
+            echo 'QEMU VNC did not start'
+            exit 1
+          }
+
+      - name: Upload engine
         uses: actions/upload-artifact@v4
         with:
           name: qemu-engine
@@ -192,26 +215,30 @@ jobs:
           if-no-files-found: error
 
   apk:
+    name: Build CatCore APK
     needs: engine
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+      - name: Show workflow revision
+        run: echo 'CatCore workflow r5 - setup-android@v4'
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK without obsolete tools package
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
@@ -221,15 +248,18 @@ jobs:
           name: qemu-engine
           path: app/src/main/jniLibs/arm64-v8a
 
-      - name: Add OVMF firmware
+      - name: Add UEFI OVMF firmware
         shell: bash
         run: |
           set -euo pipefail
-          F=app/src/main/assets/firmware
-          mkdir -p "$F"
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq ovmf
+
+          mkdir -p app/src/main/assets/firmware
+
           D=/usr/share/OVMF
+
           if [ -f "$D/OVMF_CODE_4M.fd" ]; then
             C="$D/OVMF_CODE_4M.fd"
             V="$D/OVMF_VARS_4M.fd"
@@ -237,13 +267,15 @@ jobs:
             C="$D/OVMF_CODE.fd"
             V="$D/OVMF_VARS.fd"
           fi
-          cp -L "$C" "$F/OVMF_CODE.fd"
-          cp -L "$V" "$F/OVMF_VARS.fd"
 
-      - name: Check engine and firmware
+          cp -L "$C" app/src/main/assets/firmware/OVMF_CODE.fd
+          cp -L "$V" app/src/main/assets/firmware/OVMF_VARS.fd
+
+      - name: Require engine and firmware
         shell: bash
         run: |
           set -euo pipefail
+
           test -s app/src/main/jniLibs/arm64-v8a/libqemu-system-x86_64.so
           test -s app/src/main/assets/firmware/OVMF_CODE.fd
           test -s app/src/main/assets/firmware/OVMF_VARS.fd
@@ -251,32 +283,40 @@ jobs:
       - name: Build debug APK
         shell: bash
         run: |
+          set -euo pipefail
+
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            ./gradlew assembleDebug --no-daemon
+            ./gradlew assembleDebug --no-daemon --stacktrace
           else
-            gradle assembleDebug --no-daemon
+            gradle assembleDebug --no-daemon --stacktrace
           fi
 
-      - name: Verify APK and rename
+      - name: Check APK contents
         shell: bash
         run: |
           set -euo pipefail
-          APK=app/build/outputs/apk/debug/app-debug.apk
-          test -s "$APK"
-          unzip -l "$APK" | grep -F 'lib/arm64-v8a/libqemu-system-x86_64.so'
-          unzip -l "$APK" | grep -F 'assets/firmware/OVMF_CODE.fd'
-          unzip -l "$APK" | grep -F 'assets/firmware/OVMF_VARS.fd'
-          cp "$APK" CatCore-debug.apk
 
-      - name: Upload CatCore APK
+          A=app/build/outputs/apk/debug/app-debug.apk
+
+          test -s "$A"
+
+          unzip -l "$A" > apk-files.txt
+
+          grep -Fq 'lib/arm64-v8a/libqemu-system-x86_64.so' apk-files.txt
+          grep -Fq 'assets/firmware/OVMF_CODE.fd' apk-files.txt
+          grep -Fq 'assets/firmware/OVMF_VARS.fd' apk-files.txt
+
+          cp "$A" CatCore-debug.apk
+
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: CatCore-debug-apk
           path: CatCore-debug.apk
           if-no-files-found: error
 
-      - name: Publish release (tags only)
+      - name: Publish GitHub release for tags
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
